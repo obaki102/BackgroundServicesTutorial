@@ -1,59 +1,90 @@
 using System.Text.Json;
 using Hangfire;
-using HangFire.Web.Properties.Jobs;
+using HangFire.Web;
+using HangFire.Web.Jobs;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.AddConsole();
 builder.Services.AddHttpClient();
+builder.Services.Configure<ConfigSettings>(builder.Configuration.GetSection("ConfigSettings"));
 builder.Services.AddHangfire(config =>
 {
-  var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+    var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 
-  config.UseSqlServerStorage(connectionString);
-  config.UseColouredConsoleLogProvider();
+    config.UseSqlServerStorage(connectionString);
+    config.UseColouredConsoleLogProvider();
 });
 
 builder.Services.AddHangfireServer();
+
 var app = builder.Build();
 app.MapHangfireDashboard();
-app.MapGet("/pull", (IBackgroundJobClient bg) =>
-{
-  var url = "https://consultwithgriff.com/rss.xml";
-  var directory = @"C:\repos\BackgroundServicesTutorial\rss\";
-  var filename = "consultwithgriff.json";
-  var tempPath = Path.Combine(directory, filename);
 
-  var result = bg.Enqueue<WebPuller>(p => p.GetRssItemUrlsAsync(url, tempPath));
+
+var configOptions = app.Services.GetRequiredService<IOptions<ConfigSettings>>();
+var config = configOptions.Value;
+
+//Example:
+//0   1   *   *   *
+//^   ^   ^   ^   ^
+//|   |   |   |   |
+//|   |   |   |   |
+//|   |   |   | Day of the week
+//|   |   |   Month
+//|   |   Day of the month
+//|   Hour
+//Minute
+
+//Meaning: runs 1:00am every day, every month, every day of the week
+//`*` means `every` or `any` value
+
+
+//Example: *****
+//Meaning: runs every minutes
+//Recurring Job
+RecurringJob.AddOrUpdate<WebPuller>("pull-rss-feed",
+                                    p => p.GetRssItemUrlsAsync(config.RssUrl, config.TempPath),
+                                    "* * * * *");
+//Recurring Delete
+RecurringJob.RemoveIfExists("id to delete");
+
+app.MapGet("/trigger-recurringjob", (IBackgroundJobClient bg) =>
+{
+    RecurringJob.TriggerJob("pull-rss-feed");
 });
 
-app.MapGet("/sync", (IBackgroundJobClient bg) =>
+
+app.MapGet("/on-demand", (IBackgroundJobClient bg) =>
 {
-  var directory = @"C:\repos\BackgroundServicesTutorial\rss";
-  var filename = "consultwithgriff.json";
 
-  var path = Path.Combine(directory, filename);
-  var json = File.ReadAllText(path);
-  var rssItemUrls = JsonSerializer.Deserialize<List<string>>(json);
+    bg.Enqueue<WebPuller>(p => p.GetRssItemUrlsAsync(config.RssUrl, config.TempPath));
+});
 
-  var outputPath = Path.Combine(directory, "output");
-  if (!Directory.Exists(outputPath)) Directory.CreateDirectory(outputPath);
+app.MapGet("/scheduled", (IBackgroundJobClient bg) =>
+{
+    var json = File.ReadAllText(config.TempPath);
+    var rssItemUrls = JsonSerializer.Deserialize<List<string>>(json);
 
-  if (rssItemUrls == null || rssItemUrls.Count == 0) return;
-  var delayInSeconds = 5;
-  foreach (var url in rssItemUrls)
-  {
-    var u = new Uri(url);
-    var stub = u.Segments.Last();
-    // trim trailing slash, if any and add .html
-    if (stub.EndsWith("/")) stub = stub.Substring(0, stub.Length - 1);
-    stub += ".html";
+    var outputPath = Path.Combine(config.Directory, "output");
+    if (!Directory.Exists(outputPath)) Directory.CreateDirectory(outputPath);
 
-    var filePath = Path.Combine(outputPath, stub);
+    if (rssItemUrls == null || rssItemUrls.Count == 0) return;
+    var delayInSeconds = 5;
+    foreach (var url in rssItemUrls.Take(5))
+    {
+        var u = new Uri(url);
+        var stub = u.Segments.Last();
+        // trim trailing slash, if any and add .html
+        if (stub.EndsWith("/")) stub = stub.Substring(0, stub.Length - 1);
+        stub += ".html";
 
-    bg.Schedule<WebPuller>(p => p.DownloadFileFromUrl(url, filePath),
-        TimeSpan.FromSeconds(delayInSeconds));
-    delayInSeconds += 5;
-  }
+        var filePath = Path.Combine(outputPath, stub);
+
+        bg.Schedule<WebPuller>(p => p.DownloadFileFromUrl(url, filePath),
+            TimeSpan.FromSeconds(delayInSeconds));
+        delayInSeconds += 5;
+    }
 });
 
 app.Run();
